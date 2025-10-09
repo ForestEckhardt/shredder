@@ -26,8 +26,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// fmt.Println(string(notificationsOutput))
-
 	var rawNotifications []Notification
 
 	err = json.Unmarshal(notificationsOutput, &rawNotifications)
