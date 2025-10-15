@@ -1,59 +1,66 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
+	"context"
 	"log"
 	"os/exec"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+
+	"github.com/google/go-github/v76/github"
 )
 
-type Notification struct {
-	ID      string `json:"id"`
-	Subject struct {
-		URL  string `json:"url"`
-		Type string `json:"type"`
-	} `json:"subject"`
-}
-
 func main() {
-	notificationsCommand := exec.Command("gh", "api", "/notifications", "--paginate")
-
-	notificationsOutput, err := notificationsCommand.Output()
+	token, err := exec.Command("gh", "auth", "token").Output()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	var rawNotifications []Notification
+	ctx := context.Background()
 
-	err = json.Unmarshal(notificationsOutput, &rawNotifications)
-	if err != nil {
-		log.Fatal(err)
+	client := github.NewClient(nil).WithAuthToken(strings.TrimSpace(string(token)))
+
+	// Get all notifications
+	opts := &github.NotificationListOptions{ListOptions: github.ListOptions{PerPage: 100}}
+
+	var allNotifications []*github.Notification
+	for {
+		notifications, resp, err := client.Activity.ListNotifications(ctx, opts)
+		if err != nil {
+			log.Fatalf("failed to list notifications: %v", err)
+		}
+
+		allNotifications = append(allNotifications, notifications...)
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
 	}
 
-	rawNotificationsChan := make(chan Notification, len(rawNotifications))
-	filteredNotificationsChan := make(chan Notification, len(rawNotifications))
+	allNotificationsChan := make(chan *github.Notification, len(allNotifications))
+	filteredNotificationsChan := make(chan *github.Notification, len(allNotifications))
 
 	var wg sync.WaitGroup
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
-		go filter(rawNotificationsChan, filteredNotificationsChan, &wg)
+		go filter(allNotificationsChan, filteredNotificationsChan, ctx, client, &wg)
 	}
 
-	for _, notification := range rawNotifications {
-		rawNotificationsChan <- notification
+	for _, notification := range allNotifications {
+		allNotificationsChan <- notification
 	}
 
-	close(rawNotificationsChan)
+	close(allNotificationsChan)
 
 	wg.Wait()
 
 	for i := 0; i < runtime.NumCPU(); i++ {
 		wg.Add(1)
-		go remove(filteredNotificationsChan, &wg)
+		go remove(filteredNotificationsChan, ctx, client, &wg)
 	}
 
 	close(filteredNotificationsChan)
@@ -61,45 +68,55 @@ func main() {
 	wg.Wait()
 }
 
-func filter(rawNotifications chan Notification, filteredNotifications chan Notification, wg *sync.WaitGroup) {
+func filter(allNotifications chan *github.Notification, filteredNotifications chan *github.Notification, ctx context.Context, client *github.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	for notification := range rawNotifications {
-		if notification.Subject.Type != "PullRequest" {
+	for notification := range allNotifications {
+		if notification.GetSubject().GetType() != "PullRequest" {
 			continue
 		}
 
-		apiEndpoint := strings.TrimPrefix(notification.Subject.URL, "https://api.github.com")
-		PRStateCheckCommand := exec.Command("gh", "api", apiEndpoint)
-		PRStateCheckOuput, err := PRStateCheckCommand.Output()
+		apiURL := notification.GetSubject().GetURL()
+
+		re := regexp.MustCompile(`https:\/\/api\.github\.com\/repos\/([\w|-]+)\/([\w|-]+)\/pulls\/(\d+)`)
+		matches := re.FindStringSubmatch(apiURL)
+
+		owner := matches[1]
+		repo := matches[2]
+		prNumber, err := strconv.Atoi(matches[3])
 		if err != nil {
 			log.Println(err)
 			continue
 		}
 
-		var PRState struct {
-			State string `json:"state"`
+		pr, _, err := client.PullRequests.Get(ctx, owner, repo, prNumber)
+		if err != nil {
+			log.Printf("failed to fetch PR for %s: %v", apiURL, err)
+			continue
 		}
 
-		json.Unmarshal(PRStateCheckOuput, &PRState)
-
-		if PRState.State == "closed" {
+		if pr.GetState() == "closed" {
 			filteredNotifications <- notification
 		}
 	}
 }
 
-func remove(removeNotifications chan Notification, wg *sync.WaitGroup) {
+func remove(removeNotifications chan *github.Notification, ctx context.Context, client *github.Client, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for notification := range removeNotifications {
-		apiEndpoint := fmt.Sprintf("/notifications/threads/%s", notification.ID)
-		RemoveNotificationCommand := exec.Command("gh", "api", "--method", "DELETE", apiEndpoint)
-		err := RemoveNotificationCommand.Run()
+		notificationID, err := strconv.ParseInt(notification.GetID(), 0, 64)
 		if err != nil {
 			log.Println(err)
 			continue
 		}
-		log.Printf("Removed notification for %s\n", notification.Subject.URL)
+
+		_, err = client.Activity.MarkThreadDone(ctx, notificationID)
+		if err != nil {
+			log.Printf("failed to mark notification %s as done %v", notification.GetID(), err)
+			continue
+		}
+
+		log.Printf("Removed notification for %s\n", notification.GetSubject().GetURL())
 	}
 }
